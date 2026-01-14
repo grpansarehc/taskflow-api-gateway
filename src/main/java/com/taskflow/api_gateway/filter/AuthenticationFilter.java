@@ -57,7 +57,12 @@ public class AuthenticationFilter extends AbstractGatewayFilterFactory<Authentic
                 String email = jwtUtils.getEmail(authHeader);
 
                 // 4. Mutate Request (Add Headers for Downstream Services)
+                // Remove existing headers to prevent spoofing/duplication
                 request = exchange.getRequest().mutate()
+                        .headers(httpHeaders -> {
+                            httpHeaders.remove("X-User-Id");
+                            httpHeaders.remove("X-User-Email");
+                        })
                         .header("X-User-Id", userId) // PMS will read this!
                         .header("X-User-Email", email)
                         .build();
