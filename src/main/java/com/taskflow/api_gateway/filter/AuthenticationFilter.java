@@ -1,25 +1,21 @@
 package com.taskflow.api_gateway.filter;
 
-import com.taskflow.api_gateway.util.JwtUtils;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.gateway.filter.GatewayFilter;
 import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.security.core.context.ReactiveSecurityContextHolder;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 import org.springframework.stereotype.Component;
-import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Mono;
 
+/**
+ * Authentication Filter for API Gateway
+ * Extracts user information from Keycloak JWT and forwards to downstream services
+ */
 @Component
 public class AuthenticationFilter extends AbstractGatewayFilterFactory<AuthenticationFilter.Config> {
-
-    @Autowired
-    private WebClient.Builder webClientBuilder;
-
-    @Autowired
-    private JwtUtils jwtUtils;
 
     public AuthenticationFilter() {
         super(Config.class);
@@ -30,50 +26,81 @@ public class AuthenticationFilter extends AbstractGatewayFilterFactory<Authentic
         return (exchange, chain) -> {
             ServerHttpRequest request = exchange.getRequest();
 
+            // Skip authentication for OPTIONS requests (CORS preflight)
             if (request.getMethod().equals(HttpMethod.OPTIONS)) {
                 return chain.filter(exchange);
             }
 
+            // Skip authentication for public endpoints (handled by SecurityConfig)
             String path = request.getURI().getPath();
             if (path.contains("/v3/api-docs") || path.contains("/swagger-ui") || path.contains("/webjars")) {
                 return chain.filter(exchange);
             }
 
-            if (!request.getHeaders().containsKey(HttpHeaders.AUTHORIZATION)) {
-                throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Missing Authorization Header");
-            }
-
-            String authHeader = exchange.getRequest().getHeaders().get(HttpHeaders.AUTHORIZATION).get(0);
-            if (authHeader != null && authHeader.startsWith("Bearer ")) {
-                authHeader = authHeader.substring(7);
-            }
-
-            try {
-                // 2. Validate Token (Throws exception if invalid)
-                jwtUtils.validateJwtToken(authHeader);
-
-                // 3. Extract User Info
-                String userId = jwtUtils.getUserId(authHeader);
-                String email = jwtUtils.getEmail(authHeader);
-
-                // 4. Mutate Request (Add Headers for Downstream Services)
-                // Remove existing headers to prevent spoofing/duplication
-                request = exchange.getRequest().mutate()
+            // Extract JWT from security context (already validated by Spring Security)
+            return ReactiveSecurityContextHolder.getContext()
+                .map(securityContext -> securityContext.getAuthentication())
+                .filter(authentication -> authentication instanceof JwtAuthenticationToken)
+                .map(authentication -> (JwtAuthenticationToken) authentication)
+                .map(jwtAuth -> jwtAuth.getToken())
+                .flatMap(jwt -> {
+                    // Extract user information from Keycloak JWT claims
+                    String userId = extractUserId(jwt);
+                    String email = extractEmail(jwt);
+                    
+                    // Mutate request to add user headers for downstream services
+                    ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
                         .headers(httpHeaders -> {
+                            // Remove existing headers to prevent spoofing
                             httpHeaders.remove("X-User-Id");
                             httpHeaders.remove("X-User-Email");
                         })
-                        .header("X-User-Id", userId) // PMS will read this!
+                        .header("X-User-Id", userId)
                         .header("X-User-Email", email)
                         .build();
 
-                return chain.filter(exchange.mutate().request(request).build());
-
-            } catch (Exception e) {
-                System.err.println("Invalid Token: " + e.getMessage());
-                throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid Token");
-            }
+                    return chain.filter(exchange.mutate().request(mutatedRequest).build());
+                })
+                .switchIfEmpty(chain.filter(exchange)); // Continue if no JWT (public endpoints)
         };
+    }
+
+    /**
+     * Extract user ID from Keycloak JWT
+     * Keycloak uses 'sub' claim for user ID
+     */
+    private String extractUserId(Jwt jwt) {
+        // Try to get 'sub' claim (Keycloak user ID)
+        String sub = jwt.getSubject();
+        if (sub != null) {
+            return sub;
+        }
+        
+        // Fallback to 'userId' claim if custom mapper is configured
+        Object userIdClaim = jwt.getClaim("userId");
+        if (userIdClaim != null) {
+            return userIdClaim.toString();
+        }
+        
+        return "unknown";
+    }
+
+    /**
+     * Extract email from Keycloak JWT
+     */
+    private String extractEmail(Jwt jwt) {
+        Object emailClaim = jwt.getClaim("email");
+        if (emailClaim != null) {
+            return emailClaim.toString();
+        }
+        
+        // Fallback to preferred_username (usually email in Keycloak)
+        Object preferredUsername = jwt.getClaim("preferred_username");
+        if (preferredUsername != null) {
+            return preferredUsername.toString();
+        }
+        
+        return "unknown";
     }
 
     public static class Config {
